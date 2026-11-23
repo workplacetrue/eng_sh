@@ -2,10 +2,28 @@
 
 import asyncio
 import platform
+import re
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Protocol
+
+LETTERS = re.compile(r"[A-Za-z]|[А-Яа-яЁё]")
+SAY_VOICE = re.compile(r"^(.+?)\s+(en|ru)[_-][A-Z]{2}\s+#")
+PREFERRED_VOICES = {"en": "Samantha", "ru": "Milena"}
+
+
+def speech_segments(text):
+    language = None
+    start = 0
+    for match in LETTERS.finditer(text):
+        current = "en" if match[0].isascii() else "ru"
+        if language and current != language:
+            yield language, text[start : match.start()].strip()
+            start = match.start()
+        language = current
+    if language:
+        yield language, text[start:].strip()
 
 
 class SpeechAdapter(Protocol):
@@ -16,23 +34,56 @@ class SpeechAdapter(Protocol):
 class LocalSpeech:
     def __init__(self, settings):
         self.settings = settings
+        self.voices = None
 
     def check_tts(self):
         if platform.system() != "Darwin" or not shutil.which("say"):
             raise RuntimeError("Локальная озвучка требует macOS say; текстовый режим доступен.")
 
-    async def speak(self, text: str):
-        self.check_tts()
-        # stdin avoids treating model-produced text as shell or command arguments.
+    async def available_voices(self):
         process = await asyncio.create_subprocess_exec(
             "say",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
+            "-v",
+            "?",
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await process.communicate(text.encode())
+        output, _ = await process.communicate()
         if process.returncode:
-            raise RuntimeError("macOS say не смогла произнести текст. Проверьте системные голоса.")
+            raise RuntimeError("Не удалось получить список голосов macOS say.")
+        voices = {}
+        for line in output.decode(errors="replace").splitlines():
+            match = SAY_VOICE.match(line)
+            if match:
+                voice, language = match.groups()
+                if language not in voices or voice == PREFERRED_VOICES[language]:
+                    voices[language] = voice
+        return voices
+
+    async def speak(self, text: str):
+        self.check_tts()
+        if self.voices is None:
+            self.voices = await self.available_voices()
+        segments = list(speech_segments(text))
+        for language, _ in segments:
+            if language not in self.voices:
+                name = "русский" if language == "ru" else "английский"
+                raise RuntimeError(f"Установите {name} голос в настройках речи macOS.")
+        for language, segment in segments:
+            # stdin avoids treating model-produced text as shell or command arguments.
+            process = await asyncio.create_subprocess_exec(
+                "say",
+                "-v",
+                self.voices[language],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await process.communicate(segment.encode())
+            if process.returncode:
+                raise RuntimeError(
+                    "macOS say не смогла произнести текст. Проверьте системные голоса."
+                )
 
     async def record_and_transcribe(self, seconds: int) -> str:
         if not 1 <= seconds <= 30:

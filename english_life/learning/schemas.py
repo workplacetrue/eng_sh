@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 SkillName = Literal[
     "reading", "listening", "speaking_independence", "grammar", "vocabulary", "communication"
@@ -24,6 +24,8 @@ class ReviewItem(BaseModel):
 
 
 class Turn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     reply: str = Field(min_length=1, max_length=3500)
     finished: bool = False
     summary: str = Field(default="", max_length=1500)

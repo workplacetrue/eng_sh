@@ -13,10 +13,18 @@ async def save_result(db, profile, lesson, turn: Turn, now):
     accepted = []
     modes = {entry.get("mode", "text") for entry in lesson.state if entry["role"] == "user"}
     for evidence in turn.evidence:
-        if evidence.skill in {"speaking_independence", "grammar"} and "voice" not in modes:
+        if (
+            evidence.skill in {"speaking_independence", "grammar"}
+            and not lesson.result.get("had_voice_input")
+            and "voice" not in modes
+        ):
             continue  # Text-only production cannot establish grammar IN SPEECH.
-        if evidence.skill == "listening" and not lesson.result.get("listening_delivered"):
-            continue
+        if evidence.skill == "listening":
+            if not lesson.result.get("listening_delivered") or (
+                lesson.result.get("listening_pending")
+                and not lesson.result.get("listening_answered")
+            ):
+                continue
         accepted.append(evidence.model_dump())
         previous = skills.get(evidence.skill, {})
         skills[evidence.skill] = {
@@ -28,7 +36,8 @@ async def save_result(db, profile, lesson, turn: Turn, now):
             "date": now.isoformat(),
         }
     profile.skills = skills
-    profile.diagnosed = profile.diagnosed or lesson.mode == "diagnostic"
+    if lesson.mode == "diagnostic" and accepted:
+        profile.diagnosed = True
     profile.last_topic = lesson.topic
     if profile.last_report is None:
         profile.last_report = now

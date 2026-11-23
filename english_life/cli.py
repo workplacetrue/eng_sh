@@ -12,7 +12,13 @@ from sqlalchemy.engine import make_url
 
 from english_life.agents.runner import DemoAgent, create_backend
 from english_life.config import Settings
-from english_life.learning.service import BudgetExceeded, LearningService, aware
+from english_life.learning.service import (
+    LISTENING_QUESTION,
+    LISTENING_SCRIPT,
+    BudgetExceeded,
+    LearningService,
+    aware,
+)
 from english_life.memory.db import create_local_schema, database
 from english_life.memory.models import Profile, utcnow
 
@@ -89,7 +95,7 @@ async def chat(settings, demo=False, smoke=False):
         if demo:
             print("Демо: детерминированный ответ, без LLM и оценки навыков.")
         async with sessions() as db:
-            lesson = await service.active(db, 1)
+            lesson = await service.pending(db, 1)
             profile = await db.get(Profile, 1)
             if lesson:
                 print(
@@ -113,12 +119,15 @@ async def chat(settings, demo=False, smoke=False):
                     max(0, (aware(lesson.deadline) - utcnow()).total_seconds()) if lesson else None
                 )
             mode = "text"
+            handling_timeout = False
             try:
                 try:
                     text = await asyncio.wait_for(read_line("You > "), timeout=wait)
                 except TimeoutError:
                     print("\nВремя занятия истекло. Подвожу итоги…")
                     text = "/timeout"
+                except EOFError:
+                    text = "quit"
                 if text in {"quit", "exit"}:
                     if lesson:
                         sequence += 1
@@ -133,35 +142,21 @@ async def chat(settings, demo=False, smoke=False):
                     if await read_line("Удалить всю учебную историю? Введите DELETE: ") != "DELETE":
                         print("Отменено.")
                         continue
-                if text == "/resume":
-                    if lesson:
-                        print(
-                            next(
-                                (
-                                    x["content"]
-                                    for x in reversed(lesson.state)
-                                    if x["role"] == "assistant"
-                                ),
-                                "Начните с /start.",
-                            )
-                        )
-                        continue
-                    text = "/lesson 5"  # Service resumes paused session with its remaining time.
                 if text in {"/voice", "/text"}:
-                    spoken = text == "/voice"
-                    if spoken:
+                    if text == "/voice":
                         speech.check_tts()
+                    spoken = text == "/voice"
                     print("Озвучка включена." if spoken else "Текстовый режим.")
                     continue
                 if text == "/listen":
                     if not lesson or lesson.mode != "diagnostic":
                         print("Сначала начните диагностику /start.")
                         continue
-                    from english_life.learning.service import LISTENING_SCRIPT
-
                     await speech.speak(LISTENING_SCRIPT)
                     await service.listening_delivered(1)
-                    print("What time does the train leave, and which platform?")
+                    print(LISTENING_QUESTION)
+                    if spoken:
+                        await speech.speak(LISTENING_QUESTION)
                     continue
                 if text.startswith("/record"):
                     parts = text.split()
@@ -170,7 +165,9 @@ async def chat(settings, demo=False, smoke=False):
                     print("Распознано:", text)
                     mode = "voice"
                 sequence += 1
+                handling_timeout = text == "/timeout"
                 reply = await service.handle(1, sequence, text, mode)
+                handling_timeout = False
                 print("Tutor >", reply)
                 if spoken:
                     await speech.speak(reply)
@@ -182,8 +179,8 @@ async def chat(settings, demo=False, smoke=False):
                     print(str(error))
                 else:
                     print(f"Ошибка {type(error).__name__}. Прогресс сохранён; повторите запрос.")
-                if text == "/timeout":
-                    print("Автозавершение отложено. /finish — повторить, /pause — пауза.")
+                if handling_timeout:
+                    print("Автозавершение отложено. Используйте /finish, чтобы повторить.")
                     # Avoid a zero-timeout busy loop if inference or validation failed.
                     sequence += 1
                     await service.handle(1, sequence, "/pause")

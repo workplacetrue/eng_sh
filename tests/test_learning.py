@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 
 from english_life.config import Settings
 from english_life.learning.schemas import Evidence, ReviewItem, Turn
-from english_life.learning.service import BudgetExceeded, LearningService
+from english_life.learning.service import LISTENING_QUESTION, BudgetExceeded, LearningService, aware
 from english_life.memory.db import create_local_schema, database
 from english_life.memory.models import Base, Lesson, Profile, Receipt, Review, Snapshot, utcnow
 
@@ -138,6 +138,105 @@ async def test_budget_due_reviews_and_listening(env):
     with pytest.raises(BudgetExceeded):
         await service.handle(11, 5, "Hello")
     assert "40/100" in await service.handle(11, 6, "/progress")
+
+
+async def test_resume_restores_fractional_time_and_keeps_scenario(env, monkeypatch):
+    service, agent, sessions = env
+    now = utcnow()
+    monkeypatch.setattr("english_life.learning.service.utcnow", lambda: now)
+    respond = agent.respond
+
+    async def slow_opening(context, history, message):
+        nonlocal now
+        if not history:
+            now += timedelta(seconds=45)
+        return await respond(context, history, message)
+
+    monkeypatch.setattr(agent, "respond", slow_opening)
+    opening = await service.handle(11, 1, "/lesson 10")
+    async with sessions() as db:
+        original = await service.active(db, 11)
+        assert aware(original.deadline) == now + timedelta(minutes=10)
+    now += timedelta(minutes=10) - timedelta(milliseconds=400)
+    await service.handle(11, 2, "/pause")
+    now += timedelta(hours=3)
+    assert "на паузе" in await service.handle(11, 3, "/start")
+    await service.handle(11, 4, "/pause")
+    service.settings.daily_api_calls = 1
+    restarted = LearningService(sessions, agent, service.settings)
+    assert opening in await restarted.handle(11, 5, "/resume")
+    async with sessions() as db:
+        resumed = await restarted.active(db, 11)
+        assert (resumed.id, resumed.minutes, resumed.topic) == (original.id, 10, original.topic)
+        assert aware(resumed.deadline) == now + timedelta(milliseconds=400)
+        assert "remaining_seconds" not in resumed.result
+        assert (await db.get(Profile, 11)).api_calls == 1
+    assert await restarted.handle(11, 6, "/resume") == opening
+    assert "ещё идёт" in await restarted.handle(11, 7, "/timeout")
+    now += timedelta(milliseconds=400)
+    assert "Ответов для оценки пока нет" in await restarted.handle(11, 8, "/timeout")
+    assert len(agent.calls) == 1
+
+
+async def test_finish_paused_without_answers_does_not_assess(env):
+    service, agent, sessions = env
+    service.settings.daily_api_calls = 1
+    await service.handle(11, 1, "/start")
+    assert "Введите ответ" in await service.handle(11, 2, "  ")
+    await service.handle(11, 3, "/pause")
+    assert "Ответов для оценки пока нет" in await service.handle(11, 4, "/finish")
+    assert "Нет незавершённого занятия" in await service.handle(11, 5, "/resume")
+    assert len(agent.calls) == 1
+    async with sessions() as db:
+        profile = await db.get(Profile, 11)
+        assert not profile.diagnosed and profile.skills == {}
+        lesson = await db.scalar(select(Lesson))
+        assert lesson.status == "completed" and lesson.result["evidence"] == []
+
+
+async def test_premature_finish_rolls_back_opening(env, monkeypatch):
+    service, agent, sessions = env
+
+    async def premature(*args):
+        return Turn(reply="Занятие завершено.", summary="Итог.", finished=True)
+
+    monkeypatch.setattr(agent, "respond", premature)
+    with pytest.raises(ValueError, match="до первого задания"):
+        await service.handle(11, 1, "/start")
+    async with sessions() as db:
+        assert await db.scalar(select(Lesson)) is None
+        assert await db.get(Receipt, (11, 1)) is None
+        assert not (await db.get(Profile, 11)).diagnosed
+
+
+async def test_listening_question_survives_pause_and_context_keeps_response(env):
+    service, agent, sessions = env
+    await service.handle(11, 1, "/start")
+    await service.listening_delivered(11)
+    await service.handle(11, 2, "/pause")
+    restarted = LearningService(sessions, agent, service.settings)
+    assert LISTENING_QUESTION in await restarted.handle(11, 3, "/resume")
+    await restarted.handle(11, 4, "Ten thirty, platform four.", "voice")
+    assert agent.calls[-1][0]["listening_question"] == LISTENING_QUESTION
+    await restarted.handle(11, 5, "/finish")
+    context, history, _ = agent.calls[-1]
+    assert "listening_question" not in context
+    assert history[-2]["in_reply_to"] == LISTENING_QUESTION
+
+
+async def test_old_voice_answer_still_counts_after_history_is_trimmed(env):
+    service, agent, sessions = env
+    await service.handle(11, 1, "/start")
+    await service.handle(11, 2, "A coffee, please.", "voice")
+    for index in range(3, 14):
+        await service.handle(11, index, "Another answer.")
+    await service.handle(11, 14, "/finish")
+    context, history, _ = agent.calls[-1]
+    assert not any(turn.get("mode") == "voice" for turn in history)
+    assert context["topic"] == agent.calls[0][0]["topic"]
+    assert history[:2] == agent.calls[1][1]
+    async with sessions() as db:
+        assert "speaking_independence" in (await db.get(Profile, 11)).skills
 
 
 def test_invalid_result_and_url():
