@@ -7,7 +7,7 @@ from english_life.learning.schemas import Turn
 from english_life.memory.models import Review, Snapshot
 
 
-async def save_result(db, profile, lesson, turn: Turn, now):
+async def save_result(db, profile, lesson, turn: Turn, now, *, keep_dialogue=False):
     turn = Turn.model_validate(turn)
     skills = dict(profile.skills)
     accepted = []
@@ -63,6 +63,7 @@ async def save_result(db, profile, lesson, turn: Turn, now):
         "mastered_situations": turn.mastered_situations,
     }
     lesson.status = "completed"
-    lesson.state = []
-    db.add(Snapshot(user_id=profile.user_id, skills=skills))
+    if not keep_dialogue:
+        lesson.state = []
+        db.add(Snapshot(user_id=profile.user_id, skills=skills))
     await db.flush()  # A reply claiming completion is sent only after the caller commits.

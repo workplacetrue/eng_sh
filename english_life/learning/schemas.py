@@ -23,12 +23,15 @@ class ReviewItem(BaseModel):
     recalled: bool = False
 
 
-class Turn(BaseModel):
+class Assessment(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    reply: str = Field(min_length=1, max_length=3500)
-    finished: bool = False
-    summary: str = Field(default="", max_length=1500)
     evidence: list[Evidence] = Field(default_factory=list, max_length=6)
     reviews: list[ReviewItem] = Field(default_factory=list, max_length=5)
     mastered_situations: list[str] = Field(default_factory=list, max_length=5)
+
+
+class Turn(Assessment):
+    reply: str = Field(min_length=1, max_length=3500)
+    finished: bool = False
+    summary: str = Field(default="", max_length=1500)

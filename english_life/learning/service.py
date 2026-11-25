@@ -5,6 +5,7 @@ from math import ceil
 
 from sqlalchemy import delete, func, select
 
+from english_life.agents.runner import InvalidModelOutput
 from english_life.learning.planner import choose_scenario
 from english_life.learning.schemas import Turn
 from english_life.memory.models import Lesson, Profile, Receipt, Review, utcnow
@@ -324,7 +325,15 @@ class LearningService:
             context["listening_question"] = LISTENING_QUESTION
         # Bound payload and memory growth; preserve first instructions and recent exchanges.
         history = lesson.state[:2] + lesson.state[-18:] if len(lesson.state) > 20 else lesson.state
-        turn = await self.agent.respond(context, history, message)
+        keep_dialogue = False
+        try:
+            turn = await self.agent.respond(context, history, message)
+        except InvalidModelOutput:
+            if not force:
+                raise
+            reply = "Занятие завершено. Ответы сохранены. Модель не смогла подготовить разбор."
+            turn = Turn(reply=reply, summary=reply, finished=True)
+            keep_dialogue = True
         if force and not turn.finished:
             raise ValueError(
                 "Модель не подвела итоги. Повторите /finish или отправьте ответ ещё раз."
@@ -343,12 +352,13 @@ class LearningService:
             learner_turn["in_reply_to"] = LISTENING_QUESTION
         if answering and input_mode == "voice":
             lesson.result = {**lesson.result, "had_voice_input": True}
-        lesson.state = history + [
+        stored_history = lesson.state if keep_dialogue else history
+        lesson.state = stored_history + [
             learner_turn,
             {"role": "assistant", "content": turn.reply},
         ]
         if turn.finished:
-            await save_result(db, profile, lesson, turn, now)
+            await save_result(db, profile, lesson, turn, now, keep_dialogue=keep_dialogue)
         return turn.reply
 
     async def listening_delivered(self, user_id):

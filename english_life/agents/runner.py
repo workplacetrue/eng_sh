@@ -1,8 +1,12 @@
-"""Transport-independent agent contract. LearningService knows only respond()."""
+"""Transport-independent tutor backends and their response contract."""
 
 from typing import Protocol
 
 from english_life.learning.schemas import Turn
+
+
+class InvalidModelOutput(RuntimeError):
+    pass
 
 
 class TutorBackend(Protocol):

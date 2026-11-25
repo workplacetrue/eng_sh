@@ -12,17 +12,17 @@ from sqlalchemy import select
 from english_life.agents.ollama_backend import (
     BackendUnavailable,
     DiagnosticOpening,
-    InvalidModelOutput,
     OllamaAgent,
+    OllamaConclusion,
     OllamaTurn,
 )
-from english_life.agents.runner import DemoAgent
+from english_life.agents.runner import DemoAgent, InvalidModelOutput
 from english_life.cli import chat, single_instance
 from english_life.config import Settings
 from english_life.learning.schemas import Turn
 from english_life.learning.service import LISTENING_QUESTION, LISTENING_SCRIPT, LearningService
 from english_life.memory.db import create_local_schema, database
-from english_life.memory.models import Lesson, Profile, Receipt, utcnow
+from english_life.memory.models import Lesson, Profile, Receipt, Snapshot, utcnow
 from english_life.voice.local import LocalSpeech
 
 
@@ -187,6 +187,93 @@ async def test_invalid_followup_never_writes_progress(tmp_path, body):
             lesson = await service.active(db, 1)
             assert len(lesson.state) == 2 and lesson.state[-1]["content"] == opening
             assert await db.get(Receipt, (1, 2)) is None
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("command", ["/timeout", "/finish"])
+@pytest.mark.parametrize("valid_feedback", [True, False])
+async def test_ollama_concludes_diagnostic_after_dialogue(tmp_path, command, valid_feedback):
+    settings = settings_for(tmp_path)
+    settings.model = "qwen3.5:4b"
+    requests = []
+    first_answer = "Friday morning."
+    second_answer = "Can I finish the report next Monday? I have another job to do."
+    feedback = "Вы верно поняли срок и вежливо попросили больше времени."
+    responses = iter(
+        [
+            model_reply(
+                reading_passage="My manager asked me to finish the report by Friday morning.",
+                question="When must I finish the report?",
+            ),
+            model_reply(reply="Hi, I'm your manager. Will the report be ready by Friday morning?"),
+            model_reply(
+                reply="Monday works. Can you send it before lunch?",
+                instruction_ru="Завершите разговор вежливо. " * 40 + "'Good",
+            ),
+            model_reply(
+                feedback_ru=feedback,
+                evidence=[
+                    {
+                        "skill": "reading",
+                        "task": "Identify the deadline",
+                        "hints": 0,
+                        "demonstrated": True,
+                        "score": 60,
+                    }
+                ],
+            )
+            if valid_feedback
+            else {**model_reply(feedback_ru="Модель начала разбор"), "done_reason": "length"},
+        ]
+    )
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=next(responses))
+
+    async with httpx.AsyncClient(
+        base_url=settings.ollama_url, transport=httpx.MockTransport(handler)
+    ) as client:
+        engine, sessions = database(settings.database_url)
+        await create_local_schema(engine)
+        backend = OllamaAgent(settings, client)
+        service = LearningService(sessions, backend, settings)
+        await service.handle(1, 1, "/start")
+        await service.handle(1, 2, first_answer)
+        assert (
+            await service.handle(1, 3, second_answer)
+            == "Monday works. Can you send it before lunch?"
+        )
+        async with sessions.begin() as db:
+            lesson = await service.active(db, 1)
+            lesson.deadline = utcnow() - timedelta(seconds=1)
+        if command == "/finish":
+            await service.handle(1, 4, "/pause")
+            service = LearningService(sessions, backend, settings)
+
+        result = await service.handle(1, 5, command)
+        assert "instruction_ru" not in requests[2]["format"]["properties"]
+        assert requests[3]["format"] == OllamaConclusion.model_json_schema()
+        assert requests[3]["format"]["required"] == ["feedback_ru"]
+        assert requests[3]["messages"][-1] == {"role": "user", "content": command}
+        assert second_answer in [turn["content"] for turn in requests[3]["messages"]]
+        assert "Нет незавершённого занятия" in await service.handle(1, 6, "/finish")
+        async with sessions() as db:
+            lesson = await db.scalar(select(Lesson))
+            profile = await db.get(Profile, 1)
+            assert lesson.status == "completed"
+            assert lesson.result["summary"] == result
+            if valid_feedback:
+                assert result == feedback and not lesson.state
+                assert profile.diagnosed and profile.skills["reading"]["score"] == 60
+            else:
+                assert "Ответы сохранены" in result
+                assert lesson.result["evidence"] == []
+                assert [first_answer, second_answer] == [
+                    turn["content"] for turn in lesson.state[2:6:2]
+                ]
+                assert not profile.diagnosed and profile.skills == {}
+                assert await db.scalar(select(Snapshot)) is None
         await engine.dispose()
 
 

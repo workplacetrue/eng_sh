@@ -45,7 +45,7 @@ class Lesson(Base):
     started: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default="active")
-    # Only unfinished lessons retain bounded conversation state. Cleared at completion.
+    # Bounded dialogue retained until the lesson is evaluated.
     state: Mapped[list] = mapped_column(JSON, default=list)
     result: Mapped[dict] = mapped_column(JSON, default=dict)
 
