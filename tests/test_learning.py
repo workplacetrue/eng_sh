@@ -58,6 +58,7 @@ async def test_completion_restart_isolation_and_delete(env):
     await restarted.handle(11, 3, "/finish")
     assert len(agent.calls[-1][1]) == 4
     progress = await restarted.handle(11, 4, "/progress")
+    assert progress.splitlines()[0] == "Карта навыков · предварительный уровень A2 · цель B1"
     assert "40/100" in progress
     assert "Listening comprehension: пока" in progress
     assert "Speaking independence: пока" in progress

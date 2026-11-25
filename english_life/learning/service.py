@@ -6,6 +6,7 @@ from math import ceil
 from sqlalchemy import delete, func, select
 
 from english_life.agents.runner import InvalidModelOutput
+from english_life.config import ASSUMED_LEVEL, TARGET_LEVEL
 from english_life.learning.planner import choose_scenario
 from english_life.learning.schemas import Turn
 from english_life.memory.models import Lesson, Profile, Receipt, Review, utcnow
@@ -148,7 +149,9 @@ class LearningService:
                 else "Текстовые ответы включены."
             )
         if message in {"/progress", "/weekly"}:
-            lines = ["Карта навыков · цель B1 → B2 (не официальный CEFR)."]
+            lines = [
+                f"Карта навыков · предварительный уровень {ASSUMED_LEVEL} · цель {TARGET_LEVEL}"
+            ]
             for key, label in SKILLS.items():
                 value = profile.skills.get(key)
                 if value:
@@ -325,7 +328,7 @@ class LearningService:
             context["listening_question"] = LISTENING_QUESTION
         # Bound payload and memory growth; preserve first instructions and recent exchanges.
         history = lesson.state[:2] + lesson.state[-18:] if len(lesson.state) > 20 else lesson.state
-        keep_dialogue = False
+        assessment_failed = False
         try:
             turn = await self.agent.respond(context, history, message)
         except InvalidModelOutput:
@@ -333,7 +336,7 @@ class LearningService:
                 raise
             reply = "Занятие завершено. Ответы сохранены. Модель не смогла подготовить разбор."
             turn = Turn(reply=reply, summary=reply, finished=True)
-            keep_dialogue = True
+            assessment_failed = True
         if force and not turn.finished:
             raise ValueError(
                 "Модель не подвела итоги. Повторите /finish или отправьте ответ ещё раз."
@@ -352,13 +355,19 @@ class LearningService:
             learner_turn["in_reply_to"] = LISTENING_QUESTION
         if answering and input_mode == "voice":
             lesson.result = {**lesson.result, "had_voice_input": True}
-        stored_history = lesson.state if keep_dialogue else history
+        is_diagnostic = lesson.mode == "diagnostic"
+        keep_unassessed_dialogue = turn.finished and (assessment_failed or is_diagnostic)
+        stored_history = lesson.state if keep_unassessed_dialogue else history
         lesson.state = stored_history + [
             learner_turn,
             {"role": "assistant", "content": turn.reply},
         ]
         if turn.finished:
-            await save_result(db, profile, lesson, turn, now, keep_dialogue=keep_dialogue)
+            assessed = await save_result(
+                db, profile, lesson, turn, now, keep_unassessed_dialogue=keep_unassessed_dialogue
+            )
+            if is_diagnostic and not assessed and not assessment_failed:
+                return turn.reply + "\n\nВ этой диагностике оценки навыков не получены."
         return turn.reply
 
     async def listening_delivered(self, user_id):

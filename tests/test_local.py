@@ -191,14 +191,30 @@ async def test_invalid_followup_never_writes_progress(tmp_path, body):
 
 
 @pytest.mark.parametrize("command", ["/timeout", "/finish"])
-@pytest.mark.parametrize("valid_feedback", [True, False])
-async def test_ollama_concludes_diagnostic_after_dialogue(tmp_path, command, valid_feedback):
+@pytest.mark.parametrize("feedback_type", ["scored", "unscored", "truncated"])
+async def test_ollama_concludes_diagnostic_after_dialogue(tmp_path, command, feedback_type):
     settings = settings_for(tmp_path)
     settings.model = "qwen3.5:4b"
     requests = []
     first_answer = "Friday morning."
     second_answer = "Can I finish the report next Monday? I have another job to do."
     feedback = "Вы верно поняли срок и вежливо попросили больше времени."
+    conclusions = {
+        "scored": model_reply(
+            feedback_ru=feedback,
+            evidence=[
+                {
+                    "skill": "reading",
+                    "task": "Identify the deadline",
+                    "hints": 0,
+                    "demonstrated": True,
+                    "score": 60,
+                }
+            ],
+        ),
+        "unscored": model_reply(feedback_ru=feedback),
+        "truncated": {**model_reply(feedback_ru="Модель начала разбор"), "done_reason": "length"},
+    }
     responses = iter(
         [
             model_reply(
@@ -210,20 +226,7 @@ async def test_ollama_concludes_diagnostic_after_dialogue(tmp_path, command, val
                 reply="Monday works. Can you send it before lunch?",
                 instruction_ru="Завершите разговор вежливо. " * 40 + "'Good",
             ),
-            model_reply(
-                feedback_ru=feedback,
-                evidence=[
-                    {
-                        "skill": "reading",
-                        "task": "Identify the deadline",
-                        "hints": 0,
-                        "demonstrated": True,
-                        "score": 60,
-                    }
-                ],
-            )
-            if valid_feedback
-            else {**model_reply(feedback_ru="Модель начала разбор"), "done_reason": "length"},
+            conclusions[feedback_type],
         ]
     )
 
@@ -254,7 +257,7 @@ async def test_ollama_concludes_diagnostic_after_dialogue(tmp_path, command, val
         result = await service.handle(1, 5, command)
         assert "instruction_ru" not in requests[2]["format"]["properties"]
         assert requests[3]["format"] == OllamaConclusion.model_json_schema()
-        assert requests[3]["format"]["required"] == ["feedback_ru"]
+        assert set(requests[3]["format"]["required"]) == {"feedback_ru", "evidence"}
         assert requests[3]["messages"][-1] == {"role": "user", "content": command}
         assert second_answer in [turn["content"] for turn in requests[3]["messages"]]
         assert "Нет незавершённого занятия" in await service.handle(1, 6, "/finish")
@@ -262,12 +265,16 @@ async def test_ollama_concludes_diagnostic_after_dialogue(tmp_path, command, val
             lesson = await db.scalar(select(Lesson))
             profile = await db.get(Profile, 1)
             assert lesson.status == "completed"
-            assert lesson.result["summary"] == result
-            if valid_feedback:
+            if feedback_type == "scored":
+                assert lesson.result["summary"] == feedback
                 assert result == feedback and not lesson.state
                 assert profile.diagnosed and profile.skills["reading"]["score"] == 60
             else:
-                assert "Ответы сохранены" in result
+                if feedback_type == "unscored":
+                    assert lesson.result["summary"] == feedback
+                    assert "В этой диагностике оценки навыков не получены" in result
+                else:
+                    assert "Ответы сохранены" in result
                 assert lesson.result["evidence"] == []
                 assert [first_answer, second_answer] == [
                     turn["content"] for turn in lesson.state[2:6:2]
