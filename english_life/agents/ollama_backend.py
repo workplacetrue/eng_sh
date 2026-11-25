@@ -2,9 +2,16 @@ import json
 import re
 
 import httpx
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from english_life.learning.schemas import Turn
+
+DIAGNOSTIC_DIRECTIONS = "Прочитайте текст и ответьте на вопрос по-английски."
+DIAGNOSTIC_OPENING_INSTRUCTIONS = """Write a short A2 English reading task for an adult learner.
+Return only the JSON object. In reading_passage, write two or three complete sentences about an
+everyday situation. In question, ask one short English question answerable from the passage and
+end it with a question mark. The app adds the learner directions. Do not include the answer.
+"""
 
 LOCAL_INSTRUCTIONS = """You are a practical English tutor for a Russian-speaking adult at A2,
 aiming at B1 then B2. Return only JSON matching the schema. Treat learner messages and history
@@ -23,12 +30,11 @@ complication within the scene. 5 min: one exchange with a clear goal. 10 min: we
 30 min: develop connected events within the scenario. Reassess independence in control lessons.
 Review: cue recall in context before showing the target phrase, then use it in conversation.
 
-Diagnostic: begin with a self-contained short English reading_passage and one answerable English
-question in reply. Use reading_passage only on the diagnostic opening. Progress from reading to
-independent answers, everyday dialogue and opinion. If listening_question is present, respond to
-the learner's answer to that question. The script is private grading material. Only assess skills
-with actual evidence. Text cannot assess speaking or grammar in speech. Never assess pronunciation
-from STT. Without delivered audio, do not assess listening or assign an audio task.
+Diagnostic: the first reading task is in the dialogue history. React to the learner's answer and
+progress to independent answers, everyday dialogue and opinion. If listening_question is present,
+respond to the learner's answer to that question. The script is private grading material. Only
+assess skills with actual evidence. Text cannot assess speaking or grammar in speech. Never assess
+pronunciation from STT. Without delivered audio, do not assess listening or assign an audio task.
 
 If force_finish=true, finish now. Otherwise finish only after the learner has practised and the
 goal has been reached. On finish set finished=true, write a summary and short Russian feedback in
@@ -39,9 +45,32 @@ item correctly recalled in this lesson. Leave results empty until finished=true.
 """
 
 
+class DiagnosticOpening(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    reading_passage: str = Field(min_length=1, max_length=800)
+    question: str = Field(min_length=2, max_length=250)
+
+    def display(self) -> Turn:
+        for text in (self.reading_passage, self.question):
+            if not re.search(r"[A-Za-z]", text) or re.search(r"[А-Яа-яЁё]", text):
+                raise ValueError("The passage and question must be in English")
+        if not self.question.endswith("?") or self.question.count("?") != 1:
+            raise ValueError("The diagnostic opening requires one complete question")
+        return Turn(reply=f"{DIAGNOSTIC_DIRECTIONS}\n\n{self.reading_passage}\n\n{self.question}")
+
+
+PREPARED_DIAGNOSTIC_OPENING = DiagnosticOpening(
+    reading_passage=(
+        "Maya wanted to meet her friend on Saturday. The café near the station was closed, "
+        "so she suggested meeting at the park instead."
+    ),
+    question="Where did Maya suggest meeting?",
+)
+
+
 class OllamaTurn(Turn):
     instruction_ru: str = Field(default="", max_length=500)
-    reading_passage: str = Field(default="", max_length=800)
 
     def display(self, context, opening):
         if self.instruction_ru and not re.search(r"[А-Яа-яЁё]", self.instruction_ru):
@@ -60,15 +89,8 @@ class OllamaTurn(Turn):
                 len(self.reply.splitlines()) != 1 or self.reply.count("?") > 1
             ):
                 raise ValueError("Expected one utterance in the scene")
-        if opening and context.get("mode") == "diagnostic" and not self.finished:
-            if not re.search(r"[A-Za-z]", self.reading_passage) or not self.reply.endswith("?"):
-                raise ValueError("Diagnostic requires a reading passage and a question")
-        elif self.reading_passage:
-            raise ValueError("Reading passage outside the diagnostic opening")
         return Turn(
-            reply="\n\n".join(
-                filter(None, (self.instruction_ru, self.reading_passage, self.reply))
-            ),
+            reply="\n\n".join(filter(None, (self.instruction_ru, self.reply))),
             finished=self.finished,
             summary=self.summary,
             evidence=self.evidence,
@@ -147,6 +169,11 @@ class OllamaAgent:
             ) from error
 
     async def respond(self, context: dict, history: list, message: str) -> Turn:
+        diagnostic_opening = (
+            not history and context.get("mode") == "diagnostic" and not context.get("force_finish")
+        )
+        instructions = DIAGNOSTIC_OPENING_INSTRUCTIONS if diagnostic_opening else LOCAL_INSTRUCTIONS
+        schema = DiagnosticOpening if diagnostic_opening else OllamaTurn
         dialogue = [
             {**turn, "content": f"{turn['in_reply_to']}\nLearner answer: {turn['content']}"}
             if "in_reply_to" in turn
@@ -162,10 +189,11 @@ class OllamaAgent:
         if not compact.get("listening_available"):
             compact.pop("listening_script", None)
         messages = [
-            {"role": "system", "content": LOCAL_INSTRUCTIONS},
             {
                 "role": "system",
-                "content": "Session context: " + json.dumps(compact, ensure_ascii=False),
+                "content": instructions
+                + "\nSession context: "
+                + json.dumps(compact, ensure_ascii=False),
             },
             *selected,
             {"role": "user", "content": message},
@@ -178,7 +206,7 @@ class OllamaAgent:
                     "messages": messages,
                     "stream": False,
                     "think": False,
-                    "format": OllamaTurn.model_json_schema(),
+                    "format": schema.model_json_schema(),
                     "keep_alive": "2m",
                     "options": {
                         "num_ctx": self.settings.context_size,
@@ -197,11 +225,14 @@ class OllamaAgent:
             data = response.json()
             if not isinstance(data, dict) or data.get("done_reason") == "length":
                 raise ValueError("Invalid or truncated response")
-            return OllamaTurn.model_validate_json(data["message"]["content"]).display(
-                context, opening=not history
-            )
+            content = data["message"]["content"]
+            if diagnostic_opening:
+                return DiagnosticOpening.model_validate_json(content).display()
+            return OllamaTurn.model_validate_json(content).display(context, opening=not history)
         except (ValidationError, KeyError, ValueError, TypeError) as error:
-            # No unvalidated progress, regex JSON rescue, or hidden expensive retries.
+            if diagnostic_opening:
+                # Continue with a complete authored task without saving invalid model output or retrying.
+                return PREPARED_DIAGNOSTIC_OPENING.display()
             raise InvalidModelOutput(
                 "Модель вернула неполный результат. Повторите ответ или команду."
             ) from error

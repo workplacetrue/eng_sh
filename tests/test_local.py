@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from english_life.agents.ollama_backend import (
     BackendUnavailable,
+    DiagnosticOpening,
     InvalidModelOutput,
     OllamaAgent,
     OllamaTurn,
@@ -29,6 +30,10 @@ def settings_for(tmp_path):
     return Settings(
         _env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/nested/progress.db"
     )
+
+
+def model_reply(**fields):
+    return {"message": {"content": json.dumps(fields)}}
 
 
 async def test_ollama_contract_and_context_bound(tmp_path):
@@ -66,12 +71,12 @@ async def test_ollama_contract_and_context_bound(tmp_path):
     assert payload["options"]["num_ctx"] == 4096
     assert payload["format"] == OllamaTurn.model_json_schema()
     messages = payload["messages"]
-    assert '"topic": "Cafe"' in messages[1]["content"]
-    assert messages[2:4] == history[:2]
-    assert [turn["role"] for turn in messages[2:-1]] == ["user", "assistant"] * 2
+    assert '"topic": "Cafe"' in messages[0]["content"]
+    assert messages[1:3] == history[:2]
+    assert [turn["role"] for turn in messages[1:-1]] == ["user", "assistant"] * 2
     assert messages[-3]["content"].startswith("user 9 ")
     assert messages[-2]["content"].startswith("assistant 9 ")
-    assert sum(len(turn["content"]) for turn in messages[2:-1]) <= settings.history_chars
+    assert sum(len(turn["content"]) for turn in messages[1:-1]) <= settings.history_chars
     assert messages[-1] == {"role": "user", "content": "Do you have oat milk?"}
     await backend.close()
 
@@ -80,75 +85,109 @@ async def test_ollama_contract_and_context_bound(tmp_path):
     "body",
     [
         {"message": {"content": "not JSON"}},
-        {"message": {"content": '{"reply":"Hello", "evidence":[{"skill":"unknown"}]}'}},
-        {"done_reason": "length", "message": {"content": '{"reply":"partial"}'}},
-        {"message": {"content": '{"reply":"  \\n "}'}},
+        {"message": {"content": "", "thinking": "I should write a passage."}},
+        model_reply(reply="Read this and answer: Where was she?"),
+        model_reply(question="Where was she?"),
+        model_reply(reading_passage=" \n ", question="Where was she?"),
+        model_reply(reading_passage="Она была в кафе.", question="Where was she?"),
+        model_reply(reading_passage="Mia was at the cafe.", question="Where was she"),
         {
-            "message": {
-                "content": OllamaTurn(
-                    reply="Where was she?", instruction_ru="Прочитайте текст."
-                ).model_dump_json()
-            }
-        },
-        {
-            "message": {
-                "content": OllamaTurn(
-                    reply="Where was she?",
-                    instruction_ru="Read the text.",
-                    reading_passage="Mia was at the cafe.",
-                ).model_dump_json()
-            }
-        },
-        {
-            "message": {
-                "content": OllamaTurn(
-                    reply="Where was she",
-                    instruction_ru="Прочитайте текст.",
-                    reading_passage="Mia was at the cafe.",
-                ).model_dump_json()
-            }
+            **model_reply(reading_passage="Mia was at the cafe.", question="Where was she?"),
+            "done_reason": "length",
         },
         [],
-        {},
     ],
 )
-async def test_invalid_output_never_writes_progress(tmp_path, body):
+async def test_invalid_diagnostic_opening_uses_prepared_task(tmp_path, body):
     settings = settings_for(tmp_path)
-    client = httpx.AsyncClient(
-        base_url=settings.ollama_url,
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body)),
-    )
+    settings.model = "qwen3.5:4b"
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        reply = body if len(requests) == 1 else model_reply(reply="Where do you meet your friends?")
+        return httpx.Response(200, json=reply)
+
+    client = httpx.AsyncClient(base_url=settings.ollama_url, transport=httpx.MockTransport(handler))
     backend = OllamaAgent(settings, client)
     engine, sessions = database(settings.database_url)
     await create_local_schema(engine)
     service = LearningService(sessions, backend, settings)
-    with pytest.raises(InvalidModelOutput):
-        await service.handle(1, 1, "/start")
+    opening = await service.handle(1, 1, "/start")
+    assert opening.startswith("Прочитайте текст")
+    assert "The café near the station was closed" in opening
+    assert opening.endswith("Where did Maya suggest meeting?")
+    assert len(requests) == 1
+    assert await service.handle(1, 2, "At the park.") == "Where do you meet your friends?"
+    assert {"role": "assistant", "content": opening} in requests[1]["messages"]
     async with sessions() as db:
-        assert (await db.get(Profile, 1)).skills == {}
-        assert await db.scalar(select(Lesson)) is None
-        assert await db.get(Receipt, (1, 1)) is None
+        profile = await db.get(Profile, 1)
+        assert profile.skills == {} and not profile.diagnosed
+        assert (await db.scalar(select(Lesson))).status == "active"
     await backend.close()
     await engine.dispose()
 
 
 async def test_ollama_diagnostic_displays_passage_before_question(tmp_path):
     settings = settings_for(tmp_path)
-    turn = OllamaTurn(
-        instruction_ru="Прочитайте текст и ответьте по-английски.",
+    opening = DiagnosticOpening(
         reading_passage="Mia went to a café on Monday. She ordered tea.",
-        reply="What did Mia order?",
+        question="What did Mia order?",
+    )
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert set(payload["format"]["required"]) == {"reading_passage", "question"}
+        assert '"mode": "diagnostic"' in payload["messages"][0]["content"]
+        return httpx.Response(200, json=model_reply(**opening.model_dump()))
+
+    async with httpx.AsyncClient(
+        base_url=settings.ollama_url, transport=httpx.MockTransport(handler)
+    ) as client:
+        reply = await OllamaAgent(settings, client).respond({"mode": "diagnostic"}, [], "/start")
+    assert reply.reply.split("\n\n") == [
+        "Прочитайте текст и ответьте на вопрос по-английски.",
+        opening.reading_passage,
+        opening.question,
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message": {"content": "not JSON"}},
+        model_reply(reply="  \n "),
+        model_reply(reply="Hello", evidence=[{"skill": "unknown"}]),
+        {**model_reply(reply="Still writing"), "done_reason": "length"},
+    ],
+)
+async def test_invalid_followup_never_writes_progress(tmp_path, body):
+    settings = settings_for(tmp_path)
+    responses = iter(
+        [
+            model_reply(
+                reading_passage="Mia went to a café and ordered tea.",
+                question="What did Mia order?",
+            ),
+            body,
+        ]
     )
     async with httpx.AsyncClient(
         base_url=settings.ollama_url,
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200, json={"message": {"content": turn.model_dump_json()}}
-            )
-        ),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=next(responses))),
     ) as client:
-        reply = await OllamaAgent(settings, client).respond({"mode": "diagnostic"}, [], "/start")
-    assert reply.reply.split("\n\n") == [turn.instruction_ru, turn.reading_passage, turn.reply]
+        engine, sessions = database(settings.database_url)
+        await create_local_schema(engine)
+        service = LearningService(sessions, OllamaAgent(settings, client), settings)
+        opening = await service.handle(1, 1, "/start")
+        with pytest.raises(InvalidModelOutput):
+            await service.handle(1, 2, "She ordered tea.")
+        async with sessions() as db:
+            assert (await db.get(Profile, 1)).skills == {}
+            lesson = await service.active(db, 1)
+            assert len(lesson.state) == 2 and lesson.state[-1]["content"] == opening
+            assert await db.get(Receipt, (1, 2)) is None
+        await engine.dispose()
 
 
 async def test_ollama_rejects_multiline_exercise_in_lesson(tmp_path):
